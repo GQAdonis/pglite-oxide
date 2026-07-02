@@ -89,19 +89,24 @@ tools/dev/bun.sh tools/release/release-check.mjs
 ```
 
 For normal releases, leave the `Release` workflow's `release_commit` input
-empty. If a publish or dry-run fails and a later `main` commit only fixes
-release tooling, rerun `Release` from current `main` with `release_commit` set
-to the full 40-character SHA that should be published. The workflow still runs
-the latest release scripts, but it plans the release, selects CI artifacts,
-checks product tags, and verifies publication against that selected release
-commit. During `publish`, the workflow creates a temporary release-please target
-branch at the selected commit so product tags and GitHub releases point at the
-published source commit, then removes that temporary branch.
+empty. If release-please has already created product tags but a later publish
+step failed, rerun `Release` from current `main`; `publish` keeps selecting the
+current-version product tags so the idempotent publish steps can complete
+missing assets and registry outputs. If a publish or dry-run fails and a later
+`main` commit only fixes release tooling, rerun `Release` from current `main`
+with `release_commit` set to the full 40-character SHA that should be
+published. The workflow still runs the latest release scripts, but it plans the
+release, selects CI artifacts, checks product tags, and verifies publication
+against that selected release commit. During `publish`, the workflow creates a
+temporary release-please target branch at the selected commit so product tags
+and GitHub releases point at the published source commit, then removes that
+temporary branch.
 
 Do not use `release_commit` to skip CI for product source, version, changelog,
 or release metadata changes. The workflow rejects lagging release commits unless
 the intervening files are release tooling such as `.github/workflows/`,
-`.github/scripts/`, `tools/release/`, `tools/policy/`, or `tools/xtask/`.
+`.github/scripts/`, `tools/dev/`, `tools/release/`, `tools/policy/`, or
+`tools/xtask/`.
 
 ## crates.io
 
@@ -325,6 +330,9 @@ Setup:
    the repository. The release workflow creates two tags:
    - `oliphaunt-swift-v<version>` for the product release identity.
    - `<version>` for SwiftPM package resolution.
+   Legacy pglite releases already use unscoped `0.1.0` through `0.5.1` tags, so
+   the first Oliphaunt Swift release is bootstrapped from a `0.5.0` release-please
+   baseline and minor-bumped by the introductory feature commits to `0.6.0`.
 3. Publish the compatible `liboliphaunt-native-v<version>` GitHub release assets
    before or during the same release plan. The Swift SDK pins that native core
    version in `src/sdks/swift/LIBOLIPHAUNT_VERSION`.

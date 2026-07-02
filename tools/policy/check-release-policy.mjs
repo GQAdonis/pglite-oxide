@@ -1096,6 +1096,11 @@ function checkCiPolicy() {
     "check_release_pr_coverage.mjs",
     "release checks must verify release-please version bumps cover Moon-selected products through the Bun release-check orchestrator",
   );
+  assertContains(
+    ".github/scripts/check-release-intent.sh",
+    "src/sdks/swift=0.0.0 -> 0.5.0",
+    "release intent checks must allow only the documented SwiftPM bootstrap manifest seed",
+  );
   for (const repoPath of [
     ".github/workflows/release.yml",
     "tools/release/release.py",
@@ -1142,7 +1147,13 @@ function checkReleaseWorkflowPolicy() {
     "Create release-please target branch",
     "target-branch: ${{ steps.release_head.outputs.target_branch }}",
     "Remove release-please target branch",
-    'tools/dev/bun.sh tools/release/release_plan.mjs --from-product-tags --include-current-tags --head-ref "$RELEASE_HEAD_SHA" --format github-output',
+    "release_plan_args=(",
+    "--from-product-tags",
+    "--include-current-tags",
+    '--head-ref "$RELEASE_HEAD_SHA"',
+    "--format github-output",
+    "--include-current-version-tags",
+    'tools/dev/bun.sh tools/release/release_plan.mjs "${release_plan_args[@]}"',
   ]) {
     if (!releaseWorkflow.includes(snippet)) {
       fail(`Release workflow must resolve and publish from an explicit release commit: missing ${JSON.stringify(snippet)}`);
