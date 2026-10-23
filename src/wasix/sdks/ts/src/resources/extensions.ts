@@ -893,6 +893,7 @@ function extensionMountTarget(
   const allowed = [
     'lib/postgresql/',
     'share/proj/',
+    'share/gdal/',
     'share/postgresql/extension/',
     'share/postgresql/tsearch_data/',
   ];
@@ -900,6 +901,7 @@ function extensionMountTarget(
     'lib/postgresql',
     'share/proj',
     'share/postgresql',
+    'share/gdal',
     'share/postgresql/extension',
     'share/postgresql/tsearch_data',
   ]);
