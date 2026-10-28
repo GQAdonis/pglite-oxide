@@ -387,7 +387,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-save-if: ${{ env.RUST_CACHE_SAVE_IF }}
+          cache-partition: ${{ matrix.target }}
 
       - name: Restore native compiler cache
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
@@ -502,7 +502,21 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-save-if: ${{ env.RUST_CACHE_SAVE_IF }}
+          name: oliphaunt-extension-package-artifacts
+          path: target/extension-artifacts
+          if-no-files-found: error
+
+  mobile-extension-packages-android:
+    name: Extension Packages (Android)
+    needs: [affected, extension-artifacts-native-android]
+    if: ${{ !cancelled() && !failure() && needs.affected.result == 'success' && needs.extension-artifacts-native-android.result == 'success' && needs.affected.outputs.mobile_extension_package_native_targets_android_csv != '' }}
+    uses: ./.github/workflows/mobile-extension-packages.yml
+    with:
+      cache-save-if: ${{ needs.affected.outputs.cache_save_if == 'true' }}
+      family: android
+      targets: ${{ needs.affected.outputs.mobile_extension_package_native_targets_android_csv }}
+      products: ${{ needs.affected.outputs.extension_package_products_csv }}
+      job-targets: ${{ needs.affected.outputs.job_targets }}
 
       - name: Download native exact-extension artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -610,7 +624,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-save-if: ${{ env.RUST_CACHE_SAVE_IF }}
+          cache-partition: ${{ matrix.target }}
 
       - name: Set up MSVC
         if: ${{ runner.os == 'Windows' }}
@@ -796,7 +810,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
         with:
-          cache-save-if: ${{ env.RUST_CACHE_SAVE_IF }}
+          task-cache: "false"
 
       - name: Set up Apple
         uses: ./.github/actions/setup-apple

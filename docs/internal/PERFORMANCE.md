@@ -1,5 +1,10 @@
 # Performance Internals
 
+> **Historical implementation record — non-normative.** This page preserves
+> earlier performance practices, measurements, and API names. It is not current
+> release evidence or API guidance. Use `src/docs/maintainers/performance-evidence.md`
+> and the retained benchmark reports for current qualification.
+
 This page is maintainer documentation for performance tuning, measurement
 harnesses, and release profiling. Public benchmark results now live in
 [`src/docs/content/reference/performance.mdx`](../../src/docs/content/reference/performance.mdx).
@@ -45,9 +50,9 @@ The runtime uses several cache layers:
 - a persistent AOT artifact cache;
 - a runtime asset cache for immutable files;
 - an extension asset cache;
-- a template PGDATA cache for roots that use template initialization;
-- an eager PGDATA template overlay that avoids cloning the whole initialized
-  template before first query.
+- a cluster seed cache for roots that use packaged initialization;
+- an eager cluster seed overlay that avoids cloning the whole initialized seed
+  before first query.
 
 The older full-local path hardlinks immutable files into database roots when
 the filesystem supports it, then falls back to copying when linking is
@@ -63,10 +68,10 @@ for that root. The same prepared layout is used by direct databases, persistent
 paths, app-id paths, fresh and cached temporary databases, proxy roots, and
 local server mode.
 
-The eager PGDATA template overlay is also enabled by default. It mounts the
-cached initialized template as the lower `/base` filesystem and starts each
+The eager cluster seed overlay is also enabled by default. It mounts the cached
+initialized seed as the lower `/base` filesystem and starts each
 database with a tiny per-instance upper directory. When PostgreSQL opens a
-template-backed file for mutation, the runtime copies that one file into the
+seed-backed file for mutation, the runtime copies that one file into the
 upper directory before opening it.
 
 This is intentionally not a pre-provisioned pool: each database root is still
@@ -205,7 +210,7 @@ captures store globals. That is not enough by itself to ship an instant restore
 path for Postgres: a promoted design must prove correctness for PGDATA state,
 mount state, file descriptors, direct protocol state, server mode, extensions,
 and `pg_dump`. This remains a first-class performance track, but it must beat
-the current template/overlay path while passing the same runtime and extension
+the current cluster-seed overlay path while passing the same runtime and extension
 suite before it becomes default.
 
 ## Measuring Locally

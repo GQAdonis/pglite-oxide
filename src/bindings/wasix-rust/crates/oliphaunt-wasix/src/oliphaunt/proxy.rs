@@ -1,15 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
     mpsc::SyncSender,
 };
+use std::time::Duration;
 
 use crate::oliphaunt::backend::{BackendOpenKind, BackendSession};
 #[cfg(feature = "extensions")]
@@ -27,159 +26,91 @@ use crate::oliphaunt::wire::{
     response_contains_error, simple_query_message, startup_config_for_message, startup_parameter,
 };
 
-static PROTOCOL_STATS: ProtocolStats = ProtocolStats::new();
+const PROXY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
-#[doc(hidden)]
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ProtocolStatsSnapshot {
-    pub frontend_reads: u64,
-    pub frontend_bytes: u64,
-    pub frontend_messages: u64,
-    pub startup_messages: u64,
-    pub protocol_messages: u64,
-    pub simple_query_messages: u64,
-    pub parse_messages: u64,
-    pub bind_messages: u64,
-    pub execute_messages: u64,
-    pub sync_messages: u64,
-    pub flush_messages: u64,
-    pub copy_data_messages: u64,
-    pub protocol_batches: u64,
-    pub protocol_batch_bytes: u64,
-    pub backend_send_calls: u64,
-    pub backend_send_bytes: u64,
-    pub response_writes: u64,
-    pub response_bytes: u64,
-    pub socket_flushes: u64,
-    pub copy_guard_rejections: u64,
-    pub streaming_copy_handoffs: u64,
+/// Blocking PostgreSQL socket proxy for the embedded Oliphaunt runtime.
+///
+/// The proxy intentionally runs each accepted connection on one blocking thread
+/// and does not call into the WASIX backend from an async runtime. That avoids
+/// nested runtime panics when an async wrapper blocks inside the embedded engine.
+#[derive(Debug, Clone)]
+pub(crate) struct OliphauntProxy {
+    prepared_database: Arc<PreparedRuntime>,
+    postgres_config: Arc<PostgresConfig>,
+    startup_config: Arc<StartupConfig>,
+    backend_teardown_failure: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "extensions")]
+    extensions: Arc<Vec<Extension>>,
 }
 
-struct ProtocolStats {
-    enabled: AtomicBool,
-    frontend_reads: AtomicU64,
-    frontend_bytes: AtomicU64,
-    frontend_messages: AtomicU64,
-    startup_messages: AtomicU64,
-    protocol_messages: AtomicU64,
-    simple_query_messages: AtomicU64,
-    parse_messages: AtomicU64,
-    bind_messages: AtomicU64,
-    execute_messages: AtomicU64,
-    sync_messages: AtomicU64,
-    flush_messages: AtomicU64,
-    copy_data_messages: AtomicU64,
-    protocol_batches: AtomicU64,
-    protocol_batch_bytes: AtomicU64,
-    backend_send_calls: AtomicU64,
-    backend_send_bytes: AtomicU64,
-    response_writes: AtomicU64,
-    response_bytes: AtomicU64,
-    socket_flushes: AtomicU64,
-    copy_guard_rejections: AtomicU64,
-    streaming_copy_handoffs: AtomicU64,
+/// The one client socket currently owned by the sequential proxy loop.
+///
+/// A cloned handle lets [`OliphauntServer`](super::server::OliphauntServer)
+/// interrupt a blocking client read during shutdown without adding another
+/// worker or changing the single-client execution model.
+#[derive(Debug, Default)]
+pub(crate) struct ActiveConnection {
+    stream: Mutex<Option<ActiveStream>>,
 }
 
-impl ProtocolStats {
-    const fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(false),
-            frontend_reads: AtomicU64::new(0),
-            frontend_bytes: AtomicU64::new(0),
-            frontend_messages: AtomicU64::new(0),
-            startup_messages: AtomicU64::new(0),
-            protocol_messages: AtomicU64::new(0),
-            simple_query_messages: AtomicU64::new(0),
-            parse_messages: AtomicU64::new(0),
-            bind_messages: AtomicU64::new(0),
-            execute_messages: AtomicU64::new(0),
-            sync_messages: AtomicU64::new(0),
-            flush_messages: AtomicU64::new(0),
-            copy_data_messages: AtomicU64::new(0),
-            protocol_batches: AtomicU64::new(0),
-            protocol_batch_bytes: AtomicU64::new(0),
-            backend_send_calls: AtomicU64::new(0),
-            backend_send_bytes: AtomicU64::new(0),
-            response_writes: AtomicU64::new(0),
-            response_bytes: AtomicU64::new(0),
-            socket_flushes: AtomicU64::new(0),
-            copy_guard_rejections: AtomicU64::new(0),
-            streaming_copy_handoffs: AtomicU64::new(0),
+#[derive(Debug)]
+enum ActiveStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl ActiveConnection {
+    fn register_tcp(self: &Arc<Self>, stream: &TcpStream) -> Result<ActiveConnectionGuard> {
+        self.register(ActiveStream::Tcp(
+            stream
+                .try_clone()
+                .context("clone active TCP proxy connection")?,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn register_unix(self: &Arc<Self>, stream: &UnixStream) -> Result<ActiveConnectionGuard> {
+        self.register(ActiveStream::Unix(
+            stream
+                .try_clone()
+                .context("clone active Unix proxy connection")?,
+        ))
+    }
+
+    fn register(self: &Arc<Self>, stream: ActiveStream) -> Result<ActiveConnectionGuard> {
+        let mut active = self
+            .stream
+            .lock()
+            .map_err(|_| anyhow!("active proxy connection lock was poisoned"))?;
+        if active.is_some() {
+            bail!("proxy tried to serve more than one client at a time");
         }
+        *active = Some(stream);
+        Ok(ActiveConnectionGuard {
+            active: Arc::clone(self),
+        })
     }
 
-    fn reset(&self) {
-        self.enabled.store(true, Ordering::Relaxed);
-        self.frontend_reads.store(0, Ordering::Relaxed);
-        self.frontend_bytes.store(0, Ordering::Relaxed);
-        self.frontend_messages.store(0, Ordering::Relaxed);
-        self.startup_messages.store(0, Ordering::Relaxed);
-        self.protocol_messages.store(0, Ordering::Relaxed);
-        self.simple_query_messages.store(0, Ordering::Relaxed);
-        self.parse_messages.store(0, Ordering::Relaxed);
-        self.bind_messages.store(0, Ordering::Relaxed);
-        self.execute_messages.store(0, Ordering::Relaxed);
-        self.sync_messages.store(0, Ordering::Relaxed);
-        self.flush_messages.store(0, Ordering::Relaxed);
-        self.copy_data_messages.store(0, Ordering::Relaxed);
-        self.protocol_batches.store(0, Ordering::Relaxed);
-        self.protocol_batch_bytes.store(0, Ordering::Relaxed);
-        self.backend_send_calls.store(0, Ordering::Relaxed);
-        self.backend_send_bytes.store(0, Ordering::Relaxed);
-        self.response_writes.store(0, Ordering::Relaxed);
-        self.response_bytes.store(0, Ordering::Relaxed);
-        self.socket_flushes.store(0, Ordering::Relaxed);
-        self.copy_guard_rejections.store(0, Ordering::Relaxed);
-        self.streaming_copy_handoffs.store(0, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> ProtocolStatsSnapshot {
-        ProtocolStatsSnapshot {
-            frontend_reads: self.frontend_reads.load(Ordering::Relaxed),
-            frontend_bytes: self.frontend_bytes.load(Ordering::Relaxed),
-            frontend_messages: self.frontend_messages.load(Ordering::Relaxed),
-            startup_messages: self.startup_messages.load(Ordering::Relaxed),
-            protocol_messages: self.protocol_messages.load(Ordering::Relaxed),
-            simple_query_messages: self.simple_query_messages.load(Ordering::Relaxed),
-            parse_messages: self.parse_messages.load(Ordering::Relaxed),
-            bind_messages: self.bind_messages.load(Ordering::Relaxed),
-            execute_messages: self.execute_messages.load(Ordering::Relaxed),
-            sync_messages: self.sync_messages.load(Ordering::Relaxed),
-            flush_messages: self.flush_messages.load(Ordering::Relaxed),
-            copy_data_messages: self.copy_data_messages.load(Ordering::Relaxed),
-            protocol_batches: self.protocol_batches.load(Ordering::Relaxed),
-            protocol_batch_bytes: self.protocol_batch_bytes.load(Ordering::Relaxed),
-            backend_send_calls: self.backend_send_calls.load(Ordering::Relaxed),
-            backend_send_bytes: self.backend_send_bytes.load(Ordering::Relaxed),
-            response_writes: self.response_writes.load(Ordering::Relaxed),
-            response_bytes: self.response_bytes.load(Ordering::Relaxed),
-            socket_flushes: self.socket_flushes.load(Ordering::Relaxed),
-            copy_guard_rejections: self.copy_guard_rejections.load(Ordering::Relaxed),
-            streaming_copy_handoffs: self.streaming_copy_handoffs.load(Ordering::Relaxed),
-        }
-    }
-
-    fn add(counter: &AtomicU64, value: u64) {
-        if PROTOCOL_STATS.enabled.load(Ordering::Relaxed) {
-            counter.fetch_add(value, Ordering::Relaxed);
+    pub(crate) fn shutdown(&self) {
+        let Ok(active) = self.stream.lock() else {
+            return;
+        };
+        match active.as_ref() {
+            Some(ActiveStream::Tcp(stream)) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            #[cfg(unix)]
+            Some(ActiveStream::Unix(stream)) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            None => {}
         }
     }
 }
 
-#[doc(hidden)]
-pub fn reset_protocol_stats() {
-    PROTOCOL_STATS.reset();
-}
-
-#[doc(hidden)]
-pub fn disable_protocol_stats() {
-    PROTOCOL_STATS.enabled.store(false, Ordering::Relaxed);
-}
-
-#[doc(hidden)]
-pub fn protocol_stats_snapshot() -> ProtocolStatsSnapshot {
-    PROTOCOL_STATS.snapshot()
+struct ActiveConnectionGuard {
+    active: Arc<ActiveConnection>,
 }
 
 /// Blocking PostgreSQL socket proxy for the embedded Oliphaunt runtime.
@@ -201,18 +132,13 @@ impl OliphauntProxy {
     /// Create a proxy that stores the Oliphaunt runtime and cluster under `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: Arc::new(root.into()),
-            prepared_root: None,
+            prepared_database: Arc::new(outcome),
             postgres_config: Arc::new(PostgresConfig::default()),
             startup_config: Arc::new(StartupConfig::default()),
+            backend_teardown_failure: Arc::new(Mutex::new(None)),
             #[cfg(feature = "extensions")]
             extensions: Arc::new(Vec::new()),
         }
-    }
-
-    pub(crate) fn with_prepared_root(mut self, outcome: InstallOutcome) -> Self {
-        self.prepared_root = Some(Arc::new(outcome));
-        self
     }
 
     pub(crate) fn with_postgres_config(mut self, postgres_config: PostgresConfig) -> Self {
@@ -225,96 +151,53 @@ impl OliphauntProxy {
         self
     }
 
-    /// Enable bundled extensions in the proxy backend before accepting clients.
+    /// Make selected extension artifacts and required pre-start settings
+    /// available to proxy clients.
     #[cfg(feature = "extensions")]
     pub(crate) fn with_extensions(mut self, extensions: Vec<Extension>) -> Self {
         self.extensions = Arc::new(extensions);
         self
     }
 
-    /// Return the root directory used for runtime installation and cluster data.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Serve a TCP listener forever. Connections are handled one at a time.
-    pub fn serve_tcp<A>(&self, addr: A) -> Result<()>
-    where
-        A: ToSocketAddrs,
-    {
-        let listener = TcpListener::bind(addr).context("bind TCP proxy listener")?;
-        self.serve_tcp_listener(listener)
-    }
-
-    /// Serve an existing TCP listener forever. Connections are handled one at a time.
-    pub fn serve_tcp_listener(&self, listener: TcpListener) -> Result<()> {
-        for stream in listener.incoming() {
-            let stream = stream.context("accept TCP proxy connection")?;
-            self.handle_stream(stream)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn serve_tcp_listener_until_ready(
         &self,
         listener: TcpListener,
         shutdown: Arc<AtomicBool>,
+        active_connection: Arc<ActiveConnection>,
         ready: Option<SyncSender<Result<()>>>,
     ) -> Result<()> {
         if let Some(ready) = ready {
             let _ = ready.send(Ok(()));
         }
         while !shutdown.load(Ordering::SeqCst) {
-            let (stream, _) = {
-                let _phase = timing::phase("proxy.accept_wait");
-                listener.accept().context("accept TCP proxy connection")?
-            };
+            let (stream, _) = listener.accept().context("accept TCP proxy connection")?;
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            stream
-                .set_nonblocking(false)
-                .context("configure TCP proxy stream as blocking")?;
-            self.handle_stream(stream)?;
+            let result = (|| {
+                stream
+                    .set_nonblocking(false)
+                    .context("configure TCP proxy stream as blocking")?;
+                // Bound reads so shutdown does not depend on the OS interrupting
+                // an in-flight recv on a cloned socket handle.
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .context("configure TCP proxy shutdown polling")?;
+                let _active = active_connection.register_tcp(&stream)?;
+                if shutdown.load(Ordering::SeqCst) {
+                    active_connection.shutdown();
+                    return Ok(());
+                }
+                self.handle_stream(stream, &shutdown)
+            })();
+            if let Some(error) = self.connection_teardown_failure(&result) {
+                return Err(error);
+            }
+            if let Err(error) = result {
+                tracing::debug!("closing failed TCP proxy connection: {error:#}");
+            }
         }
 
-        Ok(())
-    }
-
-    /// Accept and handle one TCP connection. Intended for tests and supervised embedding.
-    pub fn accept_tcp_once(&self, listener: &TcpListener) -> Result<()> {
-        self.accept_tcp_connections(listener, 1)
-    }
-
-    /// Accept and handle `count` TCP connections using one embedded backend.
-    pub fn accept_tcp_connections(&self, listener: &TcpListener, count: usize) -> Result<()> {
-        for _ in 0..count {
-            let (stream, _) = listener.accept().context("accept TCP proxy connection")?;
-            self.handle_stream(stream)?;
-        }
-        Ok(())
-    }
-
-    /// Serve a Unix-domain socket forever. Connections are handled one at a time.
-    #[cfg(unix)]
-    pub fn serve_unix(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
-        if path.exists() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove stale socket {}", path.display()))?;
-        }
-        let listener = UnixListener::bind(path)
-            .with_context(|| format!("bind Unix proxy socket {}", path.display()))?;
-        self.serve_unix_listener(listener)
-    }
-
-    /// Serve an existing Unix-domain listener forever. Connections are handled one at a time.
-    #[cfg(unix)]
-    pub fn serve_unix_listener(&self, listener: UnixListener) -> Result<()> {
-        for stream in listener.incoming() {
-            let stream = stream.context("accept Unix proxy connection")?;
-            self.handle_stream(stream)?;
-        }
         Ok(())
     }
 
@@ -323,59 +206,51 @@ impl OliphauntProxy {
         &self,
         listener: UnixListener,
         shutdown: Arc<AtomicBool>,
+        active_connection: Arc<ActiveConnection>,
         ready: Option<SyncSender<Result<()>>>,
     ) -> Result<()> {
         if let Some(ready) = ready {
             let _ = ready.send(Ok(()));
         }
         while !shutdown.load(Ordering::SeqCst) {
-            let (stream, _) = {
-                let _phase = timing::phase("proxy.accept_wait");
-                listener.accept().context("accept Unix proxy connection")?
-            };
+            let (stream, _) = listener.accept().context("accept Unix proxy connection")?;
             if shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            stream
-                .set_nonblocking(false)
-                .context("configure Unix proxy stream as blocking")?;
-            self.handle_stream(stream)?;
+            let result = (|| {
+                stream
+                    .set_nonblocking(false)
+                    .context("configure Unix proxy stream as blocking")?;
+                let _active = active_connection.register_unix(&stream)?;
+                if shutdown.load(Ordering::SeqCst) {
+                    active_connection.shutdown();
+                    return Ok(());
+                }
+                self.handle_stream(stream, &shutdown)
+            })();
+            if let Some(error) = self.connection_teardown_failure(&result) {
+                return Err(error);
+            }
+            if let Err(error) = result {
+                tracing::debug!("closing failed Unix proxy connection: {error:#}");
+            }
         }
 
         Ok(())
     }
 
-    /// Accept and handle one Unix-domain socket connection.
-    #[cfg(unix)]
-    pub fn accept_unix_once(&self, listener: &UnixListener) -> Result<()> {
-        self.accept_unix_connections(listener, 1)
-    }
-
-    /// Accept and handle `count` Unix-domain socket connections using one embedded backend.
-    #[cfg(unix)]
-    pub fn accept_unix_connections(&self, listener: &UnixListener, count: usize) -> Result<()> {
-        for _ in 0..count {
-            let (stream, _) = listener.accept().context("accept Unix proxy connection")?;
-            self.handle_stream(stream)?;
-        }
-        Ok(())
-    }
-
-    fn handle_stream<S>(&self, mut stream: S) -> Result<()>
+    fn handle_stream<S>(&self, mut stream: S, shutdown: &Arc<AtomicBool>) -> Result<()>
     where
         S: CloneProtocolStream,
     {
-        let _phase = timing::phase("proxy.handle_stream");
         let mut backend = None::<WireBackend>;
         let mut reader = FrontendFrameReader::default();
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = [0u8; PROXY_READ_BUFFER_BYTES];
         let mut protocol_batch = Vec::new();
 
         loop {
-            let read = {
-                let _phase = timing::phase("proxy.stream_read");
-                stream.read(&mut buffer).context("read frontend socket")?
-            };
+            let read = read_frontend(&mut stream, &mut buffer, shutdown)
+                .context("read frontend socket")?;
             if read == 0 {
                 flush_protocol_batch_if_started(
                     &mut protocol_batch,
@@ -384,16 +259,9 @@ impl OliphauntProxy {
                 )?;
                 break;
             }
-            ProtocolStats::add(&PROTOCOL_STATS.frontend_reads, 1);
-            ProtocolStats::add(&PROTOCOL_STATS.frontend_bytes, read as u64);
-
             let mut close_after_flush = false;
-            let messages = {
-                let _phase = timing::phase("proxy.frontend_parse");
-                reader.push(&buffer[..read])?
-            };
+            let messages = reader.push(&buffer[..read])?;
             let message_count = messages.len();
-            ProtocolStats::add(&PROTOCOL_STATS.frontend_messages, message_count as u64);
             let mut message_index = 0usize;
             while message_index < message_count {
                 let message = &messages[message_index];
@@ -405,7 +273,6 @@ impl OliphauntProxy {
                             &mut stream,
                         )?;
                         {
-                            let _phase = timing::phase("proxy.startup_response_write");
                             if !write_frontend(&mut stream, b"N", "write SSL refusal")? {
                                 close_after_flush = true;
                             }
@@ -428,7 +295,6 @@ impl OliphauntProxy {
                         close_after_flush = true;
                     }
                     FrontendFrameKind::Startup => {
-                        ProtocolStats::add(&PROTOCOL_STATS.startup_messages, 1);
                         if backend.is_some() {
                             bail!("received a second startup packet on one proxy connection");
                         }
@@ -440,13 +306,12 @@ impl OliphauntProxy {
                         let connection_startup_config =
                             startup_config_for_message(&self.startup_config, message)?;
                         let opened_result = {
-                            let _phase = timing::phase("proxy.backend_open");
                             WireBackend::open(
-                                &self.root,
-                                self.prepared_root.as_deref(),
+                                &self.prepared_database,
                                 &self.postgres_config,
                                 &connection_startup_config,
                                 self.extensions(),
+                                Arc::clone(&self.backend_teardown_failure),
                             )
                         };
                         let mut opened = match opened_result {
@@ -463,64 +328,52 @@ impl OliphauntProxy {
                                 break;
                             }
                         };
-                        let response = {
-                            let _phase = timing::phase("proxy.startup_response_backend");
-                            opened.startup(message)?
-                        };
+                        let response = opened.startup(message)?;
                         let response_accepted =
                             response.accepted && !response_contains_error(&response.output);
-                        if response_accepted {
-                            #[cfg(feature = "extensions")]
-                            {
-                                // Use the serving backend for idempotent extension setup; a separate
-                                // setup backend adds a full Postgres startup and can force WAL recovery.
-                                let _phase = timing::phase("proxy.startup_extension_setup");
-                                opened.enable_extensions(self.extensions())?;
-                            }
-                            if let Some(user) = startup_parameter(message, "user")?
-                                && user != "postgres"
-                            {
-                                let role_response = opened.set_role(user)?;
-                                if response_contains_error(&role_response) {
-                                    let _ = write_frontend(
-                                        &mut stream,
-                                        &role_response,
-                                        "write startup role rejection",
-                                    )?;
-                                    opened.close();
-                                    close_after_flush = true;
-                                    break;
-                                }
+                        if response_accepted
+                            && let Some(user) = startup_parameter(message, "user")?
+                            && user != "postgres"
+                        {
+                            let role_response = opened.set_role(user)?;
+                            if response_contains_error(&role_response) {
+                                let _ = write_frontend(
+                                    &mut stream,
+                                    &role_response,
+                                    "write startup role rejection",
+                                )?;
+                                let _ = opened.close();
+                                close_after_flush = true;
+                                break;
                             }
                         }
                         {
-                            let _phase = timing::phase("proxy.startup_response_write");
                             if !write_frontend(
                                 &mut stream,
                                 &response.output,
                                 "write startup response",
                             )? {
-                                opened.close();
+                                let _ = opened.close();
                                 close_after_flush = true;
                                 break;
                             }
                         }
                         if response_accepted {
                             if opened.supports_protocol_pump() {
-                                opened.attach_protocol_stream(
+                                opened.attach_protocol_stream(ProtocolIo(
                                     stream
                                         .try_clone_for_protocol()
                                         .context("clone frontend socket for protocol pump")?,
-                                )?;
+                                    Arc::clone(shutdown),
+                                ))?;
                             }
                             backend = Some(opened);
                         } else {
-                            opened.close();
+                            let _ = opened.close();
                             close_after_flush = true;
                         }
                     }
                     FrontendFrameKind::Protocol => {
-                        record_protocol_message(message);
                         let is_last_message_in_read = message_index + 1 == message_count;
                         let flush_after =
                             should_flush_protocol_batch(message, is_last_message_in_read);
@@ -544,7 +397,7 @@ impl OliphauntProxy {
                             };
                             if streamed {
                                 if let Some(mut opened) = backend.take() {
-                                    opened.close();
+                                    opened.close()?;
                                 }
                                 return Ok(());
                             }
@@ -554,8 +407,6 @@ impl OliphauntProxy {
                 message_index += 1;
             }
             {
-                let _phase = timing::phase("proxy.stream_flush");
-                ProtocolStats::add(&PROTOCOL_STATS.socket_flushes, 1);
                 if let Err(err) = stream.flush().context("flush frontend socket") {
                     if close_after_flush
                         && err
@@ -573,13 +424,15 @@ impl OliphauntProxy {
         }
 
         {
-            let _phase = timing::phase("proxy.connection_cleanup");
             if let Some(mut backend) = backend {
-                backend.rollback_connection_state();
-                backend.close();
+                backend.close()?;
             }
         }
         Ok(())
+    }
+
+    fn connection_teardown_failure(&self, primary: &Result<()>) -> Option<anyhow::Error> {
+        compose_connection_teardown_failure(&self.backend_teardown_failure, primary)
     }
 
     #[cfg(feature = "extensions")]
@@ -591,6 +444,22 @@ impl OliphauntProxy {
     fn extensions(&self) -> &[()] {
         &[]
     }
+}
+
+fn compose_connection_teardown_failure(
+    teardown_failure: &Mutex<Option<String>>,
+    primary: &Result<()>,
+) -> Option<anyhow::Error> {
+    let teardown = teardown_failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()?;
+    Some(match primary {
+        Ok(()) => anyhow!("WASIX proxy backend teardown failed: {teardown}"),
+        Err(primary) => anyhow!(
+            "WASIX proxy connection failed: {primary:#}; backend teardown also failed: {teardown}"
+        ),
+    })
 }
 
 trait ProtocolReadiness {
@@ -610,13 +479,7 @@ impl ProtocolReadiness for UnixStream {
     }
 }
 
-impl ProtocolStream for TcpStream {
-    fn read_ready(&mut self) -> io::Result<bool> {
-        ProtocolReadiness::read_ready(self)
-    }
-}
-
-trait CloneProtocolStream: Read + Write + Send + ProtocolStream + Sized + 'static {
+trait CloneProtocolStream: Read + Write + Send + ProtocolReadiness + Sized + 'static {
     fn try_clone_for_protocol(&self) -> io::Result<Self>;
 }
 
@@ -662,13 +525,6 @@ impl SetNonblocking for TcpStream {
 impl SetNonblocking for UnixStream {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         UnixStream::set_nonblocking(self, nonblocking)
-    }
-}
-
-#[cfg(unix)]
-impl ProtocolStream for UnixStream {
-    fn read_ready(&mut self) -> io::Result<bool> {
-        ProtocolReadiness::read_ready(self)
     }
 }
 
@@ -726,102 +582,42 @@ impl<'a> ContinuationPrefix<'a> {
     }
 }
 
-fn record_protocol_message(message: &[u8]) {
-    ProtocolStats::add(&PROTOCOL_STATS.protocol_messages, 1);
-    match message.first() {
-        Some(b'Q') => ProtocolStats::add(&PROTOCOL_STATS.simple_query_messages, 1),
-        Some(b'P') => ProtocolStats::add(&PROTOCOL_STATS.parse_messages, 1),
-        Some(b'B') => ProtocolStats::add(&PROTOCOL_STATS.bind_messages, 1),
-        Some(b'E') => ProtocolStats::add(&PROTOCOL_STATS.execute_messages, 1),
-        Some(b'S') => ProtocolStats::add(&PROTOCOL_STATS.sync_messages, 1),
-        Some(b'H') => ProtocolStats::add(&PROTOCOL_STATS.flush_messages, 1),
-        Some(b'd' | b'c' | b'f') => ProtocolStats::add(&PROTOCOL_STATS.copy_data_messages, 1),
-        _ => {}
-    }
-}
-
 struct WireBackend {
-    session: BackendSession,
+    session: ProtocolSession,
+    teardown_failure: Arc<Mutex<Option<String>>>,
+    connection_started: bool,
+    closed: bool,
 }
 
 impl WireBackend {
-    fn installed_outcome(
-        root: &Path,
-        prepared_root: Option<&InstallOutcome>,
-    ) -> Result<InstallOutcome> {
-        let _phase = timing::phase("proxy.backend_install");
-        match prepared_root {
-            Some(outcome) => Ok(outcome.clone()),
-            None => install_into(root),
-        }
-    }
-
-    #[cfg(feature = "extensions")]
     fn open(
-        root: &Path,
-        prepared_root: Option<&InstallOutcome>,
-        postgres_config: &PostgresConfig,
-        startup_config: &StartupConfig,
-        extensions: &[Extension],
+        prepared: &PreparedRuntime,
+        config: &PostgresConfig,
+        startup: &StartupConfig,
+        #[cfg(feature = "extensions")] extensions: &[Extension],
+        #[cfg(not(feature = "extensions"))] _extensions: &[()],
+        teardown_failure: Arc<Mutex<Option<String>>>,
     ) -> Result<Self> {
-        let outcome = Self::installed_outcome(root, prepared_root)?;
-        {
-            let _phase = timing::phase("proxy.extension_install");
-            install_missing_extension_archives(&outcome, extensions)?;
-        }
-        Self::open_prepared(&outcome, postgres_config, startup_config, extensions)
-    }
-
-    #[cfg(feature = "extensions")]
-    fn open_prepared(
-        outcome: &InstallOutcome,
-        postgres_config: &PostgresConfig,
-        startup_config: &StartupConfig,
-        extensions: &[Extension],
-    ) -> Result<Self> {
-        let session = BackendSession::open_with_extension_preload(
-            outcome.clone(),
-            postgres_config.clone(),
-            startup_config.clone(),
-            BackendOpenKind::Proxy,
-            extensions,
-        )?;
-        Ok(Self { session })
-    }
-
-    #[cfg(not(feature = "extensions"))]
-    fn open(
-        root: &Path,
-        prepared_root: Option<&InstallOutcome>,
-        postgres_config: &PostgresConfig,
-        startup_config: &StartupConfig,
-        _extensions: &[()],
-    ) -> Result<Self> {
-        let outcome = Self::installed_outcome(root, prepared_root)?;
-        let session = BackendSession::open(
-            outcome,
-            postgres_config.clone(),
-            startup_config.clone(),
-            BackendOpenKind::Proxy,
-        )?;
-        Ok(Self { session })
+        #[cfg(feature = "extensions")]
+        let session = prepared.open_with_extensions(config.clone(), startup.clone(), extensions)?;
+        #[cfg(not(feature = "extensions"))]
+        let session = prepared.open(config.clone(), startup.clone())?;
+        Ok(Self {
+            session,
+            teardown_failure,
+            connection_started: false,
+            closed: false,
+        })
     }
 
     fn startup(&mut self, message: &[u8]) -> Result<StartupProtocolResponse> {
-        self.session.startup_with_packet(message)
-    }
-
-    #[cfg(feature = "extensions")]
-    fn enable_extensions(&mut self, extensions: &[Extension]) -> Result<()> {
-        let _phase = timing::phase("proxy.extension_enable");
-        self.session.enable_extensions(extensions)
+        let response = self.session.startup_with_packet(message)?;
+        self.connection_started = response.accepted && !response_contains_error(&response.output);
+        Ok(response)
     }
 
     fn send(&mut self, message: &[u8]) -> Result<Vec<u8>> {
-        let _phase = timing::phase("proxy.backend_send");
-        ProtocolStats::add(&PROTOCOL_STATS.backend_send_calls, 1);
-        ProtocolStats::add(&PROTOCOL_STATS.backend_send_bytes, message.len() as u64);
-        self.session.send_buffered(message, None)
+        self.session.send_buffered(message)
     }
 
     fn supports_protocol_pump(&self) -> bool {
@@ -832,7 +628,6 @@ impl WireBackend {
     where
         S: ProtocolStream + 'static,
     {
-        let _phase = timing::phase("proxy.backend_attach_protocol_stream");
         self.session.attach_protocol_stream(stream)
     }
 
@@ -841,11 +636,8 @@ impl WireBackend {
         message: &[u8],
         continuation_prefix: ContinuationPrefix<'_>,
     ) -> Result<ProtocolPumpOutcome> {
-        let _phase = timing::phase("proxy.backend_send");
-        ProtocolStats::add(&PROTOCOL_STATS.backend_send_calls, 1);
-        ProtocolStats::add(&PROTOCOL_STATS.backend_send_bytes, message.len() as u64);
         self.session
-            .send_with_protocol_pump(message, || continuation_prefix.into_vec())
+            .send_with_connection_protocol_pump(message, || continuation_prefix.into_vec())
     }
 
     fn set_role(&mut self, user: &str) -> Result<Vec<u8>> {
@@ -861,9 +653,8 @@ impl WireBackend {
     }
 
     fn reset_session_state(&mut self) -> Result<()> {
-        let _phase = timing::phase("proxy.reset_session_state");
         for sql in ["ROLLBACK", "DISCARD ALL"] {
-            let response = self.send(&simple_query_message(sql))?;
+            let response = self.send(&simple_query(sql)?)?;
             if response.first() == Some(&b'E') {
                 bail!("reset proxy backend session state failed while running {sql}");
             }
@@ -871,9 +662,43 @@ impl WireBackend {
         Ok(())
     }
 
-    fn close(&mut self) {
-        let _phase = timing::phase("proxy.backend_shutdown");
-        let _ = self.session.shutdown();
+    fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let reset = if self.connection_started {
+            teardown_result("WASIX proxy session reset", || self.reset_session_state())
+        } else {
+            Ok(())
+        };
+        let shutdown = teardown_result("WASIX proxy backend", || {
+            self.session.shutdown()?;
+            Ok(())
+        });
+        if let Err(shutdown) = shutdown {
+            let mut retained = self
+                .teardown_failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if retained.is_none() {
+                *retained = Some(format!("shutdown proxy backend: {shutdown}"));
+            }
+        }
+        // The listener reads the independent shutdown-failure latch after
+        // every handler return. Returning only the reset failure here keeps it
+        // primary without duplicating the same shutdown text during composition.
+        reset.map_err(|error| anyhow!("reset proxy session state: {error}"))
+    }
+}
+
+impl Drop for WireBackend {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            tracing::warn!(
+                "WASIX proxy backend teardown failed; retaining the backend until process exit: {error:#}"
+            );
+        }
     }
 }
 
@@ -966,25 +791,14 @@ where
         return Ok(FlushOutcome::Continue);
     }
 
-    let outcome = {
-        let _phase = timing::phase("proxy.protocol_batch");
-        ProtocolStats::add(&PROTOCOL_STATS.protocol_batches, 1);
-        ProtocolStats::add(
-            &PROTOCOL_STATS.protocol_batch_bytes,
-            protocol_batch.len() as u64,
-        );
-        backend.send_with_protocol_pump(protocol_batch, continuation_prefix)?
-    };
+    let outcome = backend.send_with_protocol_pump(protocol_batch, continuation_prefix)?;
     protocol_batch.clear();
     match outcome {
         ProtocolPumpOutcome::Buffered(response) => {
             write_backend_response(stream, &response)?;
             Ok(FlushOutcome::Continue)
         }
-        ProtocolPumpOutcome::Streamed => {
-            ProtocolStats::add(&PROTOCOL_STATS.streaming_copy_handoffs, 1);
-            Ok(FlushOutcome::Streamed)
-        }
+        ProtocolPumpOutcome::Streamed => Ok(FlushOutcome::Streamed),
     }
 }
 
@@ -993,9 +807,6 @@ where
     S: Write,
 {
     if !response.is_empty() {
-        let _phase = timing::phase("proxy.response_write");
-        ProtocolStats::add(&PROTOCOL_STATS.response_writes, 1);
-        ProtocolStats::add(&PROTOCOL_STATS.response_bytes, response.len() as u64);
         stream
             .write_all(response)
             .context("write backend response")?;
@@ -1004,9 +815,94 @@ where
     Ok(())
 }
 
+fn startup_config_for_message(base: &StartupConfig, message: &[u8]) -> Result<StartupConfig> {
+    let mut config = base.clone();
+    if let Some(user) = startup_parameter(message, "user")? {
+        config.username = user.to_owned();
+    }
+    if let Some(database) = startup_parameter(message, "database")? {
+        config.database = database.to_owned();
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+fn read_frontend(
+    stream: &mut impl Read,
+    bytes: &mut [u8],
+    shutdown: &AtomicBool,
+) -> io::Result<usize> {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        match stream.read(bytes) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            result => return result,
+        }
+    }
+}
+
+struct ProtocolIo<S>(S, Arc<AtomicBool>);
+impl<S: Read> Read for ProtocolIo<S> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        read_frontend(&mut self.0, bytes, &self.1)
+    }
+}
+impl<S: Write> Write for ProtocolIo<S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+impl<S: Read + Write + Send + ProtocolReadiness> ProtocolStream for ProtocolIo<S> {
+    fn read_ready(&mut self) -> io::Result<bool> {
+        if self.1.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        self.0.read_ready()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_reader_retries_idle_timeouts_and_observes_shutdown() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        let (stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut protocol = ProtocolIo(stream, Arc::clone(&shutdown));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || -> io::Result<()> {
+            let mut byte = [0];
+            assert_eq!(protocol.read(&mut byte)?, 1);
+            assert_eq!(byte, [42]);
+            tx.send(()).unwrap();
+            assert_eq!(protocol.read(&mut byte)?, 0);
+            assert!(protocol.read_ready()?);
+            tx.send(()).unwrap();
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(&[42])?;
+        rx.recv_timeout(Duration::from_secs(2))?;
+        // Deliberately leave the socket open: cancellation must work even if
+        // the OS does not interrupt the pending read on the cloned handle.
+        shutdown.store(true, Ordering::SeqCst);
+        rx.recv_timeout(Duration::from_secs(2))?;
+        worker.join().unwrap()?;
+        Ok(())
+    }
 
     #[test]
     fn protocol_batch_flushes_on_client_boundaries() {
@@ -1056,12 +952,35 @@ mod tests {
         );
 
         let runtime =
-            backend_open_error_response(&anyhow!("runtime failed while opening database root"));
+            backend_open_error_response(&anyhow!("runtime failed while opening database storage"));
         assert!(runtime.windows(7).any(|window| window == b"CXX000\0"));
         assert!(
             !runtime.windows(7).any(|window| window == b"C3D000\0"),
             "runtime failures must not be reported as missing databases"
         );
+    }
+
+    #[test]
+    fn backend_shutdown_latch_is_terminal_and_preserves_primary_error_order() {
+        let teardown = Mutex::new(Some("shutdown proxy backend: injected shutdown".to_owned()));
+        let primary = Err(anyhow!("injected connection read failure"));
+        let combined = compose_connection_teardown_failure(&teardown, &primary)
+            .expect("latched shutdown failure makes the listener terminal")
+            .to_string();
+
+        assert_eq!(
+            combined.matches("injected connection read failure").count(),
+            1
+        );
+        assert_eq!(combined.matches("injected shutdown").count(), 1);
+        assert!(
+            combined.find("injected connection read failure") < combined.find("injected shutdown")
+        );
+
+        let teardown_only = compose_connection_teardown_failure(&teardown, &Ok(()))
+            .expect("shutdown failure is terminal without a connection error")
+            .to_string();
+        assert_eq!(teardown_only.matches("injected shutdown").count(), 1);
     }
 
     fn backend_ready_response() -> Vec<u8> {

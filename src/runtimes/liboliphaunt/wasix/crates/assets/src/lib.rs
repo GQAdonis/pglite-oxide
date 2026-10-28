@@ -1,8 +1,17 @@
+#![doc = include_str!("../README.md")]
 #![deny(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
 
 include!(concat!(env!("OUT_DIR"), "/generated_assets.rs"));
+
+/// PostgreSQL major whose on-disk layout is carried by this runtime family.
+pub const POSTGRES_MAJOR: u32 = 18;
+/// Version of the runtime payload selected by Cargo.
+#[doc(hidden)]
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Stable WASIX physical-storage compatibility identity.
+pub const PHYSICAL_FORMAT: &str = "wasix-pg18-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -17,8 +26,6 @@ pub struct AssetManifest {
     pub runtime_support: Vec<BinaryAsset>,
     #[serde(default)]
     pub initdb: Option<BinaryAsset>,
-    #[serde(default)]
-    pub pgdata_template: Option<PgDataTemplateAsset>,
     #[serde(default)]
     pub extensions: Vec<ExtensionAsset>,
     #[serde(default)]
@@ -88,13 +95,12 @@ pub struct ExtensionAsset {
     pub native_modules: Vec<BinaryAsset>,
     pub size: u64,
     #[serde(default)]
-    pub stable: bool,
+    pub native_modules: Vec<BinaryAsset>,
+    pub size: u64,
     #[serde(default)]
     pub control_files: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub native_dependencies: Vec<String>,
     #[serde(default)]
     pub load_order: Vec<String>,
     #[serde(default)]
@@ -107,8 +113,6 @@ pub struct ExtensionAsset {
     pub unresolved_imports: Vec<WasmImport>,
     #[serde(default)]
     pub installed_files: Vec<String>,
-    #[serde(default)]
-    pub smoke_status: Option<ExtensionSmokeStatus>,
     #[serde(default)]
     pub link: Option<WasmLinkMetadata>,
 }
@@ -131,16 +135,6 @@ pub struct ExtensionLifecycle {
     pub restart_required: bool,
     #[serde(default)]
     pub shared_memory_required: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub struct ExtensionSmokeStatus {
-    pub promoted: bool,
-    pub direct: String,
-    pub server: String,
-    pub restart: String,
-    pub dump_restore: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,5 +282,9 @@ mod tests {
             template.source_fingerprint.as_deref(),
             Some("postgresql-18.4:patch-stack")
         );
+        assert_eq!(manifest.runtime.runtime_kind, "wasix-dynamic-main");
+        if SELECTED_EXTENSION_SQL_NAMES.is_empty() {
+            assert!(manifest.extensions.is_empty());
+        }
     }
 }

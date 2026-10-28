@@ -1,0 +1,106 @@
+---
+name: add-oliphaunt-extension
+description: Add, update, or remove an Oliphaunt PostgreSQL contrib or external extension, including source pins, build recipes, target support, SDK metadata, release products, carrier identities, and package verification. Use whenever extension catalog, compatibility, packaging, or supported OS/runtime claims change.
+---
+
+# Add Oliphaunt Extension
+
+Make support claims fail closed. A runtime target existing does not prove an extension supports that target.
+
+## Classify
+
+- contrib: source is PostgreSQL 18. The SQL member belongs to the
+  `oliphaunt-extension-contrib-pg18` logical distribution at
+  `src/extensions/contrib/`. It is not an independently versioned release
+  product: its native and WASIX carriers belong to the corresponding runtime.
+  A contrib member does not own a leaf `VERSION`, changelog, `release.toml`,
+  tag, or registry identity.
+- external: source uses an immutable upstream commit, packaging versioning is `upstream-bound`, and runtime versions are compatibility metadata rather than release coupling. `release.toml` is the public-product boundary. Incomplete or blocked work stays on a branch and has no main-branch catalog state.
+
+Keep the SQL extension name distinct from the release product id and upstream project name.
+
+## Implement
+
+1. Add or update source pins, checksums, patches/dependency recipes, and Moon
+   metadata. For a public external extension, also maintain its product-local
+   `release.toml`, `VERSION`, and empty first-release `CHANGELOG.md`. Every
+   external extension must own
+   `upstream-license-data.json` beside that metadata. After changing source or
+   license pins, fetch the selected pinned sources and run
+   `moon run extensions:audit-license-sources` to compare the actual upstream
+   bytes. `extensions:packaging-unit` remains a cold-checkout packaging proof
+   and does not silently expand its coverage when a local source cache exists.
+   Freeze exactly the source
+   identities and license/notice rows used by that extension, include only the
+   referenced content-addressed blobs, and audit those bytes against the clean
+   pinned checkout. Never put independently versioned extensions into one
+   shared legal-data file. For a contrib member, update the canonical `postgres18.toml` inventory and the
+   shared contrib distribution metadata; never create leaf release state. Check
+   whether the upstream project operates an authoritative HTTPS Git mirror.
+   When it does, record that reviewed endpoint as `mirror_url` and prove that
+   it serves the exact pinned commit; never infer a mirror or use a community
+   fork merely for availability.
+2. The canonical target profiles in `src/extensions/contracts/extension-target-profiles.toml` apply to every extension on main. A target-specific exception is branch work until its format and shipped behavior are implemented together; do not add status, promotion, or blocker metadata.
+3. For an active public product, declare the stable Cargo façade plus native,
+   mobile, WASIX portable/AOT, npm, and Maven carriers actually required by the
+   owning release product. Contrib members use the shared bundle carriers and
+   retain exact nested member paths/checksums; public external extensions use
+   their independent carriers. Let size-required Cargo package parts remain
+   dynamic implementation carriers.
+4. Regenerate the shared extension model:
+
+```sh
+bash src/extensions/tools/check-extension-model.sh --write
+```
+
+Source-pin, patch, recipe, compiler-input, or producer-code changes require the
+product-owned portable/AOT build. Version, changelog, registry coordinate, and
+target-profile edits are package-envelope changes.
+
+5. Verify the model and release graph:
+
+```sh
+bash src/extensions/tools/check-extension-model.sh --check
+bash tools/release/release-check.sh
+```
+
+When source acquisition or `mirror_url` changes, also run the source-fetch
+fault suite, validate the real manifest, and perform one live exact-commit
+fetch from each newly declared endpoint. The canonical upstream must remain
+the durable origin and every transport must resolve to the same immutable pin.
+
+6. Build the exact extension artifacts for all declared targets. Require package-shape, archive safety, checksums, runtime load/create, restart, and dump/restore evidence where the target contract promises them. The exact-SHA CI lane must run `src/extensions/tools/collect-wasix-evidence.sh` against portable and host-AOT artifacts from that same workflow run. Only that collector may record `wasix-full-lifecycle-v1`; its immutable record must identify the exact commit, tree, workflow run, attempt, and job, and qualification must pass `--require-current-evidence`.
+7. Run a clean local-registry install for each ecosystem façade. For a contrib
+   bundle, select at least two members and prove that only those nested members
+   are staged even though one target carrier contains all contrib bytes. Also
+   combine one contrib member with an independently versioned external member.
+   Confirm target selection fetches only the expected carriers and an
+   unsupported target fails with a useful error. Verify each carrier's derived
+   license and notice profile; a passing profile check is not legal advice or
+   certification of comprehensive legal compliance.
+
+## Review
+
+Reject the change if a declared target lacks a produced artifact, an actual package lacks a declared identity, an external extension is runtime-version-coupled, or generated SDK metadata disagrees. Reject any promotion, blocker, deferred, planned, or unsupported extension state on main. Report upstream source identity separately from Oliphaunt package version.
+
+## Declared requirements and frozen consumers
+
+Conventional manifests own source consumer requirements. Compiled inputs,
+Release Please ecosystem updates and necessary default SDK/extension install
+updates justify generated retargets. Candidate preparation coordinates only the
+required dependency closure when exact extension hosts change; compatible SDK
+and extension updates and runtime-only releases keep independent scope. Admission
+checks the resulting default install against unchanged immutable releases.
+External extension host references declare `public_support = true`; private
+references declare `false`. Public host removal requires breaking intent before
+version selection and verification against the previous immutable product tag.
+
+Source `Qualified` and capsule preparation precede final installed consumer
+checks. Require `Frozen consumers` and `Publication ready` before bootstrap or
+normal mutation. The immutable consumer proof binds the lock, expected cases,
+test configuration, producing run/attempt and resolver/log evidence. Recovery
+imports prepared bytes and reruns these cases; an old missing/failed proof does
+not invalidate the bytes. Record installation, compilation/link and execution
+levels honestly. npm staging preserves full manifests and historical pins;
+Cargo path patches are staging evidence, not registry provenance. Keep the
+postpublication public checks and reconciliation.

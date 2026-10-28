@@ -1,17 +1,15 @@
 name: Release
 run-name: Release / ${{ inputs.operation }} / ${{ github.ref_name }}
-
 on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Prepare a release PR, dry-run publish, or publish from main
+        description: Prepare the release PR, or freeze and publish the qualified candidate
         required: true
         type: choice
         default: prepare-release-pr
         options:
           - prepare-release-pr
-          - publish-dry-run
           - publish
       release_commit:
         description: Optional full commit SHA to publish/dry-run instead of the workflow commit
@@ -21,11 +19,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -71,7 +64,6 @@ jobs:
             echo "Releases must be run from main; got ${GITHUB_REF}" >&2
             exit 1
           fi
-
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -181,6 +173,7 @@ jobs:
     if: ${{ inputs.operation != 'prepare-release-pr' }}
     environment: ${{ inputs.operation == 'publish' && 'release-publish' || 'release-dry-run' }}
     permissions:
+      contents: read
       actions: read
       attestations: write
       contents: write
@@ -188,13 +181,19 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: Require main
+      - name: Record bounded bootstrap job deadline
+        id: bootstrap_job_deadline
         run: |
-          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "Releases must be run from main; got ${GITHUB_REF}" >&2
+          if [[ ! "$RELEASE_JOB_HARD_WINDOW_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'RELEASE_JOB_HARD_WINDOW_SECONDS must be a positive integer' >&2
             exit 1
           fi
-
+          hard_deadline=$(( $(date +%s) + RELEASE_JOB_HARD_WINDOW_SECONDS ))
+          {
+            echo "REGISTRY_JOB_HARD_DEADLINE_EPOCH=$hard_deadline"
+            echo "OLIPHAUNT_GITHUB_RUN_SNAPSHOT_DIR=$RUNNER_TEMP/oliphaunt-github-run-snapshots"
+          } >> "$GITHUB_ENV"
+          echo "The bootstrap job must stop registry work before Unix time $hard_deadline."
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:

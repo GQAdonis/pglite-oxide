@@ -5,14 +5,18 @@ subject="${1:-}"
 base_ref="${2:-origin/main}"
 head_ref="${3:-HEAD}"
 head_branch="${4:-}"
+event_name="${5:-}"
+full_ref="${6:-}"
 
 if [[ -z "${subject}" ]]; then
   echo "expected a non-empty PR title or commit subject" >&2
   exit 1
 fi
 
-release_pattern='^((feat|fix|perf|refactor|revert)(\([a-z0-9][a-z0-9._/-]*\))?(!)?|[a-z]+(\([a-z0-9][a-z0-9._/-]*\))?!): .+'
-release_pr_pattern='^chore\(release\): .+'
+if ! git rev-parse --verify "${head_ref}^{commit}" >/dev/null 2>&1; then
+  echo "could not resolve release-intent head ref: ${head_ref}" >&2
+  exit 1
+fi
 
 is_release_pr=false
 is_generated_release_branch=false
@@ -27,42 +31,30 @@ if [[ "${subject}" =~ ${release_pr_pattern} ]]; then
   fi
 fi
 
-package_versions_from_ref() {
-  local ref="${1:?package_versions_from_ref requires a git ref}"
-  local files
+release_types="$({
+  git show "${head_ref}:release-please-config.json" |
+    bun "$(dirname "${BASH_SOURCE[0]}")/release-intent-data.mts" types
+})"
+if [[ -z "${release_types}" ]]; then
+  echo "could not derive release-impact types from release-please-config.json" >&2
+  exit 1
+fi
+release_pattern="^((${release_types})(\\([a-z0-9][a-z0-9._/-]*\\))?(!)?|[a-z]+(\\([a-z0-9][a-z0-9._/-]*\\))?!): .+"
+release_pr_pattern='^chore\(release\): .+'
 
   files="$(
     git ls-tree -r --name-only "${ref}" |
       grep -E '(^Cargo.toml$|^src/.*/Cargo.toml$|^tools/xtask/Cargo.toml$)' || true
   )"
 
-  while IFS= read -r file; do
-    [[ -z "${file}" ]] && continue
-    git show "${ref}:${file}" | awk -v file="${file}" '
-    /^\[package\][[:space:]]*$/ {
-      in_package = 1
-      next
-    }
-    /^\[/ && in_package {
-      exit
-    }
-    in_package && $0 ~ /^[[:space:]]*name[[:space:]]*=/ {
-      name = $0
-      sub(/^[^=]*=[[:space:]]*"/, "", name)
-      sub(/".*$/, "", name)
-    }
-    in_package && $0 ~ /^[[:space:]]*version[[:space:]]*=/ {
-      line = $0
-      sub(/^[^=]*=[[:space:]]*"/, "", line)
-      sub(/".*$/, "", line)
-      if (name == "") {
-        name = file
-      }
-      print name "=" line
-      exit
-    }
-  '
-  done <<< "${files}" | sort
+release_manifest_versions_from_ref() {
+  local ref="${1:?release_manifest_versions_from_ref requires a git ref}"
+  local manifest
+  if ! manifest="$(git show "${ref}:.release-please-manifest.json" 2>/dev/null)"; then
+    return 0
+  fi
+  printf '%s\n' "${manifest}" |
+    bun "$(dirname "${BASH_SOURCE[0]}")/release-intent-data.mts" versions
 }
 
 base_versions="$(package_versions_from_ref "${base_ref}")"
@@ -153,11 +145,11 @@ chore(release):.
 Received:
   ${subject}
 
-Base package versions:
-${base_versions}
+Base release-please manifest versions:
+${base_release_manifest_versions}
 
-Head package versions:
-${head_versions}
+Head release-please manifest versions:
+${head_release_manifest_versions}
 
 Changed existing package versions:
 ${changed_existing_versions}
@@ -199,7 +191,7 @@ This PR changes release-affecting product surfaces, but its title does not
 carry release intent.
 
 Use one of these Conventional Commit types in the PR title:
-  feat, fix, perf, refactor, revert
+  ${release_types//|/, }
 
 Breaking changes may use any type with !, for example:
   chore!: remove a deprecated API

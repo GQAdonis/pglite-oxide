@@ -2,7 +2,8 @@
 
 ## Local Checks
 
-Run the same gates as CI before opening a PR:
+Install the pinned tools once, then run the local qualification gates before
+opening a PR:
 
 ```sh
 pnpm doctor
@@ -14,6 +15,12 @@ tools/dev/bun.sh tools/release/release-publish.mjs publish-dry-run
 ```
 
 The runtime smoke starts embedded Postgres and is intentionally slower than unit tests.
+The protected `publish-dry-run` operation is a release-candidate check: run it
+from the GitHub `Release` workflow. It requires a successful, product-scoped
+`Qualified` CI record for the exact release-bump commit; the workflow reuses an
+eligible run or requests qualification when needed. The documented same-version control recovery
+uses a separately qualified linear recovery head bound to that original
+release-bump commit. It is not a routine source-PR check.
 
 Install local hooks with:
 
